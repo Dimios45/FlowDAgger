@@ -14,6 +14,9 @@ inverted targets with a behavior-cloning loss.
 This repo contains minimal reference implementations for two base-policy
 backends. Each backend has its own dependencies and runnable example.
 
+This branch also includes a separate native PyTorch backend for bimanual YAM
+cloth folding; see the YAM guide below.
+
 ## How this example works
 
 1. Roll out the base policy. A steering network outputs an
@@ -63,3 +66,15 @@ git submodule update --init flowdagger_pi05/openpi
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## YAM / native PyTorch pi0.5
+
+The separate [YAM backend](flowdagger_pi05/yam/README.md) provides prepare, invert,
+train, evaluate, verify, and Karma HTTP serving commands for a frozen LeRobot
+checkpoint. Preparation requires a verified gripper-convention manifest.
+
+The current [34-autonomous + 20-HITL training runbook](flowdagger_pi05/yam/BIMANUAL_TRAINING.md)
+documents recorded-cadence targets, 50 epochs, no holdouts, and last-epoch saving.
+See [deployment commands](flowdagger_pi05/yam/DEPLOYMENT.md) for the combined GPU
+server and Karma rollout/HITL client. Local datasets, audits, caches and weights
+are not included in Git; reproduction prerequisites are listed in the runbook.

@@ -1,0 +1,14 @@
+# Install the pi0.5-capable LeRobot checkout separately, using its own locked dependencies.
+torch>=2.7
+numpy
+pandas
+pyarrow
+Pillow
+av
+safetensors
+fastapi
+uvicorn
+json-numpy
+pytest
+httpx
+requests
