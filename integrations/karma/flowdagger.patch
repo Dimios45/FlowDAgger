@@ -1,0 +1,531 @@
+diff --git a/src/openpi_control/cameras.py b/src/openpi_control/cameras.py
+index b211565..df71168 100644
+--- a/src/openpi_control/cameras.py
++++ b/src/openpi_control/cameras.py
+@@ -530,9 +530,15 @@ class CameraReader:
+             frame = _rotate(view, self.spec.rotate) if self.spec.rotate else view.copy()
+             with self._lock:
+                 self._frame = frame
++                self._frame_received = time.monotonic()
+                 self._frames_read += 1
+             self._started.set()
+ 
++    def snapshot(self):
++        """Atomic frame + host receive time + sequence (not sensor exposure time)."""
++        with self._lock:
++            return self._frame, getattr(self, '_frame_received', None), self._frames_read
++
+     def latest(self) -> np.ndarray | None:
+         """The newest frame, in :attr:`pixel_format`, or None before the first."""
+         with self._lock:
+@@ -659,9 +665,15 @@ class OpenCVCameraReader:
+                 frame = _rotate(frame, self.spec.rotate)
+             with self._lock:
+                 self._frame = frame
++                self._frame_received = time.monotonic()
+                 self._frames_read += 1
+             self._started.set()
+ 
++    def snapshot(self):
++        """Atomic frame + host receive time + sequence (not sensor exposure time)."""
++        with self._lock:
++            return self._frame, getattr(self, '_frame_received', None), self._frames_read
++
+     def latest(self) -> np.ndarray | None:
+         with self._lock:
+             return self._frame
+diff --git a/src/openpi_control/cli.py b/src/openpi_control/cli.py
+index d0aa631..e5f015f 100644
+--- a/src/openpi_control/cli.py
++++ b/src/openpi_control/cli.py
+@@ -1843,6 +1843,10 @@ def run_hitl(
+         contract=contract,
+     )
+     client.health()
++    from .flowdagger_trace import attach
++    attach(client)
++    if client.flow_trace and (fps != 30 or speed != 1.0 or chunk_size not in (None, 30)):
++        raise ConfigurationError('FlowDAgger tracing requires --fps 30 --speed 1.0 --chunk-size 30')
+     capture_rig = rig.with_camera_capture(fps=fps, pixel_format="rgb8")
+     cameras: dict[str, cameras_mod.AnyCameraReader] = {}
+     scene = None
+@@ -1870,7 +1874,13 @@ def run_hitl(
+         state_names = record_mod.arm_feature_names(
+             rig.names, {name: contract.arm_dof for name in rig.names}
+         )
+-        features = record_mod.build_features(state_names, shapes, INTERVENTION_FEATURE)
++        extra = dict(INTERVENTION_FEATURE)
++        if client.flow_trace:
++            extra.update({k: {'dtype':'float64', 'shape':(1,), 'names':[k]} for k in
++                ('observation.capture_monotonic', 'action.command_monotonic')})
++            extra['observation.camera_monotonic'] = {'dtype':'float64','shape':(len(cameras),),'names':list(cameras)}
++            extra['observation.state_monotonic'] = {'dtype':'float64','shape':(len(rig.names),),'names':list(rig.names)}
++        features = record_mod.build_features(state_names, shapes, extra)
+         sink = record_mod.LeRobotSink(
+             repo_id=repo_id,
+             fps=fps,
+@@ -2090,6 +2100,8 @@ def _hitl_episodes(
+                 on_chunk=on_chunk,
+                 on_tick=on_policy_tick,
+             )
++            if getattr(client, 'flow_trace', None):
++                client.flow_trace.start(saved_before, episode_seconds)
+             source = DaggerSource(
+                 policy=policy,
+                 human=human,  # type: ignore[arg-type]
+@@ -2200,6 +2212,9 @@ def _hitl_episodes(
+                 if saved:
+                     print(f"  episode saved (dataset index {saved_before}; {decision})")
+         success = {"y": True, "n": False}.get(decision)
++        if getattr(client, 'flow_trace', None):
++            client.flow_trace.outcome(success is True and saved and not aborted)
++            client.flow_trace.drain()  # hardware has already been parked above
+         if not saved:
+             print("  no LeRobot episode was written for this attempt")
+         entries = manifest["episodes"]
+diff --git a/src/openpi_control/dagger.py b/src/openpi_control/dagger.py
+index f3e0871..93ae5a6 100644
+--- a/src/openpi_control/dagger.py
++++ b/src/openpi_control/dagger.py
+@@ -181,6 +181,9 @@ class DaggerSource(TeleopSource):
+             return TeleopStep(event=EpisodeEvent.STOP)
+ 
+         if self._episode_started_at is None:
++            trace = getattr(self._policy, '_trace', None)
++            if trace:
++                trace.activate()
+             self._episode_started_at = time.monotonic()
+             event = EpisodeEvent.START
+         else:
+@@ -299,6 +302,13 @@ class DaggerSource(TeleopSource):
+             # nowhere near it.
+             self._say("!  TAKE-OVER IGNORED — no arm has published a pose yet")
+             return
++        trace = getattr(self._policy, '_trace', None)
++        if trace:
++            trace.takeover()
++            self._policy._flow_pending = None
++            self._policy._plan = np.empty((0, 14))
++            self._policy._plan_index = 0
++            self._policy._prefetcher.drop()
+         self._intervening = True
+         self._interventions += 1
+         if self._on_mode_change is not None:
+@@ -322,6 +332,9 @@ class DaggerSource(TeleopSource):
+             {name: state for name, state in fresh.items() if state is not None},
+             effector=self._commanded_effector(),
+         )
++        trace = getattr(self._policy, '_trace', None)
++        if trace:
++            trace.handback()
+         self._intervening = False
+         if self._on_mode_change is not None:
+             self._on_mode_change(False)
+diff --git a/src/openpi_control/inference.py b/src/openpi_control/inference.py
+index 64ed457..d186714 100644
+--- a/src/openpi_control/inference.py
++++ b/src/openpi_control/inference.py
+@@ -393,6 +393,7 @@ class BimanualObservation:
+     state: np.ndarray
+     contract: PolicyContract = DEFAULT_CONTRACT
+     side_cam: np.ndarray | None = None
++    timing: dict | None = None
+ 
+     def __post_init__(self) -> None:
+         state = np.asarray(self.state, dtype=np.float32).reshape(-1)
+@@ -535,6 +536,10 @@ class MolmoActClient:
+             "normalization_tag": self.contract.norm_tag,
+             "enable_cuda_graph": graph,
+         }
++        trace = getattr(self, 'flow_trace', None)
++        context = trace.context() if trace else {}
++        payload.update(context)
++        payload["observation_timing"] = observation.timing
+         body = json_numpy.dumps(payload)
+         started = time.perf_counter()
+         try:
+@@ -585,6 +590,10 @@ class MolmoActClient:
+             "payload_mb": len(body) / 1e6,
+             "n_actions": float(actions.shape[0]),
+         }
++        if trace:
++            from .flowdagger_trace import TraceActions
++            actions = TraceActions(actions, {**context, **{k: result[k] for k in
++                ('request_id', 'session', 'generation')}})
+         return actions
+ 
+ 
+@@ -679,6 +688,15 @@ class ChunkPrefetcher:
+             raise InferenceError("prefetched inference returned no action chunk")
+         return result
+ 
++    def take_ready(self, observation, instruction):
++        """Never block the command/Quest polling thread on HTTP."""
++        if self._thread is None:
++            self.submit(observation, instruction)
++            return None
++        if self._thread.is_alive():
++            return None
++        return self.take(observation, instruction)
++
+     def drop(self) -> None:
+         """Abandon an in-flight or unconsumed chunk; it is stale now."""
+         self._thread = None
+@@ -769,16 +787,24 @@ def build_observation(
+     }
+ 
+     frames: dict[str, np.ndarray] = {}
++    camera_times = {}
+     for name in contract.cameras:
+         reader = readers.get(name)
+         if reader is None:
+             raise ConfigurationError(f"MolmoAct2 inference needs camera {name!r}")
+-        frame = reader.latest()
++        if hasattr(reader, 'snapshot'):
++            frame, received, sequence = reader.snapshot()
++            if received is None or time.monotonic()-received > max_age_s:
++                raise StaleStateError(f"Stale camera {name}")
++            camera_times[name] = dict(received_monotonic=received, sequence=sequence)
++        else:
++            frame = reader.latest()
+         if frame is None:
+             raise InferenceError(f"camera {name!r} has not delivered a frame")
+         frames[name] = _as_rgb(frame, pixel_format=getattr(reader, "pixel_format", "rgb8"))
+ 
+     return BimanualObservation(
++        timing=dict(cameras=camera_times, states={n:s.monotonic_timestamp for n,s in states.items()}),
+         top_cam=frames["top"],
+         left_cam=frames.get("left_wrist"),
+         right_cam=frames.get("right_wrist"),
+diff --git a/src/openpi_control/inference_record.py b/src/openpi_control/inference_record.py
+index 1e2af21..2068d39 100644
+--- a/src/openpi_control/inference_record.py
++++ b/src/openpi_control/inference_record.py
+@@ -108,7 +108,12 @@ class InferenceRolloutSource(TeleopSource):
+             max_effector_step=max_effector_step,
+             carry_targets=carry_targets,
+         )
+-        self._prefetcher = ChunkPrefetcher(client) if prefetch else None
++        self._trace = getattr(client, 'flow_trace', None)
++        if self._trace and (speed != 1.0 or chunk_size not in (None, 30)):
++            raise ValueError('Exact-noise tracing requires speed=1 and full 30-step chunks')
++        self._prefetcher = ChunkPrefetcher(client) if prefetch or self._trace else None
++        self._flow_pending = None
++        self._flow_metadata = None
+         self._episode_started_at: float | None = None
+         self._saved = False
+         self._plan = np.empty((0, self._contract.dimension), dtype=np.float64)
+@@ -150,6 +155,9 @@ class InferenceRolloutSource(TeleopSource):
+         this source must not advance its plan or spend an inference call on a
+         tick whose commands would be thrown away.
+         """
++        self._flow_pending = None
++        if self._trace and time.monotonic() >= self._trace.deadline:
++            return {}
+         fresh_states = self._fresh_states(states)
+         if fresh_states is None:
+             # Nothing is planned, stepped, or requested on this tick. The
+@@ -165,6 +173,12 @@ class InferenceRolloutSource(TeleopSource):
+                 return {}
+             self._executor.reset(fresh_states)
+             actions = self._request(observation)
++            if actions is None:
++                return {}
++            if self._trace:
++                self._flow_metadata = actions.metadata
++                if not self._trace.accepts(self._flow_metadata):
++                    return {}
+             if self._chunk_size is not None:
+                 if self._chunk_size > len(actions):
+                     raise InferenceError(
+@@ -177,6 +191,10 @@ class InferenceRolloutSource(TeleopSource):
+             if self._on_chunk is not None:
+                 self._on_chunk(self._plan.copy())
+ 
++        if self._trace:
++            if not self._trace.accepts(self._flow_metadata):
++                return {}
++            self._flow_pending = (self._flow_metadata, self._plan_index)
+         action = self._plan[self._plan_index]
+         self._plan_index += 1
+         commands = self._executor.step(action, limits=self._limits)
+@@ -233,6 +251,8 @@ class InferenceRolloutSource(TeleopSource):
+     def _request(self, observation: Any) -> np.ndarray:
+         try:
+             if self._prefetcher is not None:
++                if self._trace:
++                    return self._prefetcher.take_ready(observation, self._instruction)
+                 return self._prefetcher.take(observation, self._instruction)
+             return self._client.infer(observation, self._instruction)
+         except EncodedFramesUnsupported as err:
+@@ -246,6 +266,8 @@ class InferenceRolloutSource(TeleopSource):
+             self._client.jpeg_quality = 0
+             if self._prefetcher is not None:
+                 self._prefetcher.drop()
++            if self._trace:
++                return None  # next poll retries raw images asynchronously
+             return self._client.infer(observation, self._instruction)
+ 
+     def _maybe_prefetch(self) -> None:
+diff --git a/src/openpi_control/record.py b/src/openpi_control/record.py
+index 0bd7e8f..ef94ebc 100644
+--- a/src/openpi_control/record.py
++++ b/src/openpi_control/record.py
+@@ -543,6 +543,13 @@ def record_session(
+             }
+             if on_tick is not None:
+                 on_tick(states)
++            from .flowdagger_trace import bridge, driver
++            flow_trace = bridge(source)
++            capture_time = time.monotonic()
++            snapshots = {name: camera.snapshot() if hasattr(camera, 'snapshot') else (camera.latest(), capture_time, -1)
++                         for name,camera in cameras.items()} if flow_trace else {}
++            captured = {name: value[0] for name,value in snapshots.items()}
++            capture_time = time.monotonic()
+             step = source.poll(states)
+ 
+             if step.event is EpisodeEvent.STOP:
+@@ -627,11 +634,31 @@ def record_session(
+                     positions = np.clip(positions, lower, upper)
+                 targets[name] = ArmTarget(tuple(positions), target.effector)
+                 commands[name] = PositionCommand(positions, target.effector)
++            flow_driver = driver(source)
++            pending = getattr(flow_driver, '_flow_pending', None)
++            if flow_trace and time.monotonic() >= flow_trace.deadline:
++                if recording and frames_in_episode:
++                    sink.save_episode()
++                    recording = False
++                    total_frames += frames_in_episode
++                ended_by = 'FlowDAgger deadline'
++                break
++            if flow_trace and pending and not flow_trace.accepts(pending[0]):
++                continue
+             # Validate the full command map before moving either arm. Record
+             # the bounded targets actually sent, including human HITL targets.
+             for name, command in commands.items():
+                 arms[name].command(command)  # type: ignore[attr-defined]
+ 
++            command_time = time.monotonic()
++            if flow_trace and pending and commands:
++                sent = []
++                for name in arm_names:
++                    command = commands[name]
++                    sent.extend(command.position_rad)
++                    sent.append(command.effector)
++                flow_trace.executed(pending[0], pending[1], sent)
++                flow_driver._flow_pending = None
+             if recording:
+                 observation = observation_vector(arm_names, states, dofs)
+                 frame: dict[str, object] = {
+@@ -639,11 +666,26 @@ def record_session(
+                     "action": action_vector(arm_names, targets, observation, dofs),
+                     "task": task,
+                 }
++                if flow_trace:
++                    # New traced datasets explicitly preserve the wire/model
++                    # convention. Quest trigger inversion stays upstream.
++                    offset = 0
++                    for name in arm_names:
++                        grip_index = offset + dofs[name]
++                        frame['observation.state'][grip_index] = states[name].effector.position
++                        target = targets.get(name)
++                        frame['action'][grip_index] = (target.effector if target is not None and target.effector is not None
++                            else states[name].effector.position)
++                        offset += dofs[name]+1
++                    frame['observation.camera_monotonic'] = np.array([snapshots[c][1] or 0 for c in cameras], dtype=np.float64)
++                    frame['observation.state_monotonic'] = np.array([states[n].monotonic_timestamp for n in arm_names], dtype=np.float64)
++                    frame['observation.capture_monotonic'] = np.array([capture_time], dtype=np.float64)
++                    frame['action.command_monotonic'] = np.array([command_time], dtype=np.float64)
+                 # Validated against the recorded columns when the step was
+                 # built, so this cannot shadow the three above.
+                 frame.update(step.extras)
+                 for name, camera in cameras.items():
+-                    image = camera.latest()  # type: ignore[attr-defined]
++                    image = captured[name] if flow_trace else camera.latest()  # type: ignore[attr-defined]
+                     if image is None:
+                         image = last_frames.get(name)
+                     if image is None:
+diff --git a/src/openpi_control/flowdagger_trace.py b/src/openpi_control/flowdagger_trace.py
+new file mode 100644
+--- /dev/null
++++ b/src/openpi_control/flowdagger_trace.py
+@@ -0,0 +1,179 @@
++"""Opt-in FlowDAgger provenance for Karma; no ML/GPU dependencies.
++
++KARMA_FLOWDAGGER_TRACE_DIR enables this extension. Events are journaled before
++asynchronous delivery; robot control never waits for an event HTTP response.
++"""
++import json
++import logging
++import os
++from pathlib import Path
++import queue
++import threading
++import time
++import uuid
++
++import numpy as np
++
++
++class TraceActions(np.ndarray):
++    def __new__(cls, actions, metadata):
++        obj = np.asarray(actions).view(cls)
++        obj.metadata = dict(metadata)
++        return obj
++
++    def __array_finalize__(self, source):
++        self.metadata = getattr(source, 'metadata', {})
++
++
++class TraceBridge:
++    def __init__(self, url, health, root):
++        self.url = url.rsplit('/act', 1)[0] + '/events'
++        self.session = health['session']
++        self.generation = health['generation']
++        self.root = Path(root)
++        self.root.mkdir(parents=True, exist_ok=True)
++        self.path = self.root / (self.session + '.jsonl')
++        self.queue = queue.Queue()
++        self.lock = threading.RLock()
++        self.episode = None
++        self.dataset_episode = None
++        self.deadline = float('inf')
++        self.pending = None
++        self.error = None
++        self.worker = threading.Thread(target=self._worker, daemon=True)
++        self.worker.start()
++
++    def _worker(self):
++        import requests
++        session = requests.Session()
++        while True:
++            event = self.queue.get()
++            while True:
++                try:
++                    response = session.post(self.url, json=event, timeout=5)
++                    response.raise_for_status()
++                    self.error = None
++                    break
++                except Exception as exc:
++                    if self.error != str(exc):
++                        logging.getLogger(__name__).warning('FlowDAgger event delivery pending in %s: %s', self.path, exc)
++                    self.error = str(exc)
++                    time.sleep(.25)
++            self.queue.task_done()
++
++    def start(self, dataset_episode, seconds):
++        with self.lock:
++            self.episode = uuid.uuid4().hex
++            self.dataset_episode = int(dataset_episode)
++            self.seconds = float(seconds)
++            self.deadline = float('inf')
++
++    def activate(self):
++        if self.deadline == float('inf'):
++            self.deadline = time.monotonic() + self.seconds
++
++    def context(self):
++        # Called only by the inference worker, never by the command loop.
++        self.queue.join()
++        with self.lock:
++            return dict(session=self.session, generation=self.generation,
++                        episode_id=self.episode, dataset_episode=self.dataset_episode)
++
++    def current(self, metadata):
++        return (                metadata.get('session') == self.session and
++                metadata.get('generation') == self.generation and
++                metadata.get('episode_id') == self.episode)
++
++    def accepts(self, metadata):
++        return time.monotonic() < self.deadline and self.current(metadata)
++
++    def event(self, kind, **values):
++        with self.lock:
++            event = dict(kind=kind, session=self.session, episode_id=self.episode,
++                         event_id=uuid.uuid4().hex, monotonic=time.monotonic(), **values)
++            with self.path.open('a') as stream:
++                stream.write(json.dumps(event, allow_nan=False)+'\n')
++                stream.flush()
++                os.fsync(stream.fileno())
++            self.queue.put(event)
++
++    def flush(self):
++        with self.lock:
++            if self.pending:
++                self.event('executed', **self.pending)
++                self.pending = None
++
++    def executed(self, metadata, index, commands):
++        with self.lock:
++            if not self.current(metadata):
++                raise RuntimeError('Expired/stale FlowDAgger command')
++            request_id = metadata['request_id']
++            if self.pending and self.pending['request_id'] != request_id:
++                self.flush()
++            if self.pending is None:
++                self.pending = dict(request_id=request_id, indices=[], commands=[])
++            self.pending['indices'].append(int(index))
++            self.pending['commands'].append(np.asarray(commands).tolist())
++            if index == 29:
++                self.flush()
++
++    def takeover(self):
++        with self.lock:
++            self.flush()
++            self.event('takeover')
++            self.generation += 1
++
++    def handback(self):
++        self.event('handback')
++
++    def drain(self, timeout=5):
++        deadline = time.monotonic()+timeout
++        while self.queue.unfinished_tasks and time.monotonic()<deadline:
++            time.sleep(.01)
++        if self.queue.unfinished_tasks:
++            logging.getLogger(__name__).warning('Replay pending events from %s before training', self.path)
++        return not self.queue.unfinished_tasks
++
++    def outcome(self, success):
++        with self.lock:
++            self.flush()
++            self.event('outcome', success=bool(success))
++            self.deadline = 0
++
++
++def attach(client):
++    root = os.environ.get('KARMA_FLOWDAGGER_TRACE_DIR')
++    if root:
++        health = client.health()
++        if health.get('state_dim') != 14 or 'session' not in health:
++            raise ValueError('FlowDAgger tracing requires the instrumented YAM server')
++        client.flow_trace = TraceBridge(client.url, health, root)
++    else:
++        client.flow_trace = None
++
++
++def driver(source):
++    return getattr(source, '_policy', source)
++
++
++def bridge(source):
++    return getattr(getattr(driver(source), '_client', None), 'flow_trace', None)
++
++
++def replay(path, server):
++    """Retry a journal against the same running server/session, idempotently."""
++    import requests
++    url = server.rstrip('/').removesuffix('/act')+'/events'
++    with requests.Session() as session:
++        for line in Path(path).read_text().splitlines():
++            response = session.post(url, json=json.loads(line), timeout=10)
++            response.raise_for_status()
++
++
++if __name__ == '__main__':
++    import argparse
++    parser = argparse.ArgumentParser(description='Replay durable FlowDAgger events to the original server session')
++    parser.add_argument('--journal',required=True)
++    parser.add_argument('--server',required=True)
++    args = parser.parse_args()
++    replay(args.journal,args.server)

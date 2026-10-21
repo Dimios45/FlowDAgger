@@ -28,6 +28,16 @@ def windows(frame, stride=10):
         if not np.isin(human, [0, 1]).all():
             raise ValueError("Intervention labels must be binary")
         contiguous = (np.diff(ids) == 1) & (np.abs(np.diff(ts) - 1 / 30) < .002)
+        if "observation.capture_monotonic" in group:
+            capture = np.array([float(np.asarray(x).reshape(-1)[0]) for x in group["observation.capture_monotonic"]])
+            command = np.array([float(np.asarray(x).reshape(-1)[0]) for x in group["action.command_monotonic"]])
+            valid = np.isfinite(capture) & np.isfinite(command) & (command >= capture) & (command-capture < 1/30)
+            for key in ('observation.camera_monotonic', 'observation.state_monotonic'):
+                if key in group:
+                    arrival = np.stack(group[key].to_numpy())
+                    age = capture[:, None]-arrival
+                    valid &= np.isfinite(arrival).all(1) & (age >= 0).all(1) & (age < .25).all(1)
+            contiguous &= (np.abs(np.diff(capture)-1/30) < .015) & valid[:-1] & valid[1:]
         breaks = np.r_[True, (np.diff(human) != 0) | ~contiguous, True]
         bounds = np.flatnonzero(breaks)
         for segment, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):

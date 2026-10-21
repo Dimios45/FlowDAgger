@@ -14,9 +14,11 @@ class Policy:
         self.backend = backend
         self.conventions = verify_conventions(conventions)
         self.identity = dict(backend.identity, conventions=conventions)
-        self.actor, _ = load_actor(actor_path, self.identity, backend.device)
-        self.actor.requires_grad_(False)
-        self.actor_version = file_hash(actor_path)
+        self.actor = None
+        if actor_path:
+            self.actor, _ = load_actor(actor_path, self.identity, backend.device)
+            self.actor.requires_grad_(False)
+        self.actor_version = file_hash(actor_path) if actor_path else "base-random"
         self.traces = TraceStore(trace_dir)
         self.normalization_tag = normalization_tag
         self.lock = threading.Lock()
@@ -54,15 +56,19 @@ class Policy:
             obs["state"] = polarity(np.asarray(obs["state"], dtype=np.float32),
                                      self.conventions["wire_open"], self.conventions["model_open"])
             p = self.backend.prepare(obs)
-            noise = self.actor(p["patches"], p["state"])
-            actions = self.backend.decode_actions(self.backend.sample(p, noise))[0].cpu()
+            noise = self.actor(p["patches"], p["state"]) if self.actor is not None else torch.randn(1,30,32,device=self.backend.device)
+            terminal = self.backend.sample(p, noise)
+            actions = self.backend.decode_actions(terminal)[0].cpu()
             actions = polarity(actions, self.conventions["model_open"], self.conventions["wire_open"])
             if actions.shape != (30, 14) or not torch.isfinite(actions).all():
                 raise RuntimeError("Sampler produced invalid actions")
             record = dict(identity=self.identity, actor_version=self.actor_version,
                 episode_id=episode, dataset_episode=payload.get("dataset_episode"),
                 observation={k: torch.as_tensor(np.asarray(v).copy()) if k != "instruction" else v for k, v in obs.items()},
-                patches=p["patches"].cpu()[0], state=p["state"].cpu()[0], noise=noise.cpu()[0], actions=actions)
+                patches=p["patches"].cpu()[0], state=p["state"].cpu()[0], noise=noise.cpu()[0], actions=actions,
+                terminal=terminal.cpu()[0], request_timestamp=payload.get("timestamp"),
+                observation_timing=payload.get("observation_timing"),
+                server_monotonic=time.monotonic())
             request_id = self.traces.record(record)
             return dict(actions=actions.numpy(), dt_ms=(time.perf_counter()-start)*1000,
                         request_id=request_id, chunk_id=request_id, generation=self.traces.generation,

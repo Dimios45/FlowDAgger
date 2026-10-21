@@ -44,14 +44,24 @@ def invert_dataset(backend, manifest_path, output, limit=None):
         target = completion.clone()
         target[..., :14] = p["batch"]["action"]
         noise = backend.invert(p, target)
-        decoded = backend.sample(p, noise)
-        normalized = errors(decoded, target)
-        physical = errors(backend.decode_actions(decoded), torch.from_numpy(actions)[None])
-        normalized["accepted"] &= bool(torch.isfinite(noise).all() and torch.isfinite(decoded).all() and physical["finite"])
+        if torch.isfinite(noise).all():
+            decoded = backend.sample(p, noise)
+            normalized = errors(decoded, target)
+            physical = errors(backend.decode_actions(decoded), torch.from_numpy(actions)[None])
+            normalized["accepted"] &= bool(torch.isfinite(decoded).all() and physical["finite"])
+        else:
+            normalized = dict(finite=False, accepted=False, reason='nonfinite inverted noise')
+            physical = dict(finite=False, accepted=False)
+        from .diagnostics import noise_stats
         save_tensor(path, dict(cache_id=metadata["cache_id"], window=window, alignment=alignment,
             patches=p["patches"].cpu()[0], state=p["state"].cpu()[0], noise=noise.cpu()[0],
-            target=target.cpu()[0], normalized=normalized, physical=physical))
+            target=target.cpu()[0], normalized=normalized, physical=physical,
+            inversion_diagnostics=dict(noise=noise_stats(noise), **getattr(backend, "last_inversion_diagnostics", {}))))
         print(json.dumps(dict(example=number, **normalized)), flush=True)
+    from .diagnostics import summarize
+    _, rows = read_cache(output, accepted_only=False, require_complete=False)
+    if rows:
+        write_json(output / "inversion-summary.json", summarize(rows))
 
 
 def read_cache(root, accepted_only=True, require_complete=True):
@@ -68,16 +78,80 @@ def read_cache(root, accepted_only=True, require_complete=True):
     return meta, [e for e in examples if e["normalized"]["accepted"] or not accepted_only]
 
 
+def verify_cache_datasets(meta):
+    sources = meta.get('sources', {'single':meta})
+    for source in sources.values():
+        m = source['manifest']
+        kwargs = {'episodes':m['dataset_episodes']} if 'dataset_episodes' in m else {}
+        if Dataset(m['dataset'], **kwargs).identity() != m['dataset_identity']:
+            raise ValueError('Dataset changed since inversion')
+
+
+def example_input(meta, example):
+    source = meta['sources'][example['source_id']] if 'sources' in meta else meta
+    m = source['manifest']
+    kwargs = {'episodes':m['dataset_episodes']} if 'dataset_episodes' in m else {}
+    return model_example(Dataset(m['dataset'], **kwargs),
+        example.get('source_window',example['window']), source['identity']['conventions'])
+
+
+def merge_caches(specification, output):
+    """Aggregate disjoint collection rounds without relabeling their holdouts.
+
+    specification: [{cache: path, traces: optional original-noise trace root}].
+    Copies tensors into a new immutable cache; raw datasets remain referenced.
+    """
+    output = Path(output)
+    if output.exists():
+        raise ValueError('Use a new aggregate cache directory')
+    if not specification:
+        raise ValueError('No source caches')
+    sources, rows, mapping, trace_roots = {}, [], {}, {}
+    identity = None
+    dataset_ids = set()
+    for entry in specification:
+        source, examples = read_cache(entry['cache'], accepted_only=False)
+        if 'sources' in source:
+            raise ValueError('List original round caches, not previously merged caches')
+        verify_cache_datasets(source)
+        sid = source['cache_id']
+        did = digest(source['manifest']['dataset_identity'])
+        if sid in sources or did in dataset_ids:
+            raise ValueError('Duplicate dataset/round in aggregate')
+        dataset_ids.add(did)
+        if identity is not None and source['identity'] != identity:
+            raise ValueError('Round model/processor/convention mismatch')
+        identity = source['identity']
+        sources[sid] = source
+        mapping[sid] = {}
+        for split, episodes in source['manifest']['splits'].items():
+            for ep in episodes:
+                mapping[sid][str(ep)] = sum(len(v) for v in mapping.values())
+        if entry.get('traces'):
+            trace_roots[sid] = str(Path(entry['traces']).resolve())
+        for e in examples:
+            window = dict(e['window'], episode=mapping[sid][str(e['window']['episode'])])
+            rows.append(dict(e, window=window, source_window=e['window'], source_id=sid))
+    splits = {split:[mapping[sid][str(ep)] for sid,s in sources.items()
+                    for ep in s['manifest']['splits'][split]] for split in ('train','validation','test')}
+    manifest = dict(windows=[e['window'] for e in rows], splits=splits, aggregate=True)
+    cache_id = digest([list(sources), mapping, trace_roots])
+    meta = dict(identity=identity, manifest=manifest, cache_id=cache_id, sources=sources,
+                episode_mapping=mapping, autonomous_roots=trace_roots)
+    write_json(output/'metadata.json',meta)
+    for i,e in enumerate(rows):
+        save_tensor(output/'examples'/f'{i:06d}.pt', dict(e, cache_id=cache_id))
+    return dict(examples=len(rows), rounds=len(sources), splits=splits)
+
+
 @torch.no_grad()
 def evaluate(backend, actor, meta, examples, split, baselines=True):
-    m = meta["manifest"]
-    dataset = Dataset(m["dataset"], **({"episodes": m["dataset_episodes"]} if "dataset_episodes" in m else {}))
     results = []
     generator = torch.Generator(device=backend.device).manual_seed(0)
     for e in examples:
         if e["window"]["split"] != split:
             continue
-        obs, actions, _ = model_example(dataset, e["window"], meta["identity"]["conventions"])
+        obs, actions, _ = example_input(meta, e)
         p = backend.prepare(obs, actions)
         noise = actor(p["patches"], p["state"])
         noises = {"steered": noise}
@@ -102,8 +176,21 @@ def evaluate(backend, actor, meta, examples, split, baselines=True):
     return dict(split=split, mean_normalized_rmse=scores, examples=results)
 
 
-def train(backend, cache, output, epochs=250, patience=20, batch_size=64, seed=0, autonomous=None,
-          learning_rate=1e-4, weight_decay=1e-4, preservation_cache=None, checkpoint_selection='best',
+@torch.no_grad()
+def evaluate_traces(backend, actor, records):
+    scores = []
+    for r in records:
+        p = backend.prepare(r['observation'])
+        noise = actor(p['patches'], p['state'])
+        target = r.get('terminal')
+        if target is None:
+            target = backend.sample(p, r['noise'][None].to(backend.device))[0]
+        scores.append(errors(backend.sample(p, noise), target[None].to(backend.device))['rmse'])
+    return sum(scores)/len(scores) if scores else None
+
+
+def train(backend, cache, output, epochs=50, patience=5, batch_size=64, seed=0, autonomous=None,
+          learning_rate=3e-5, weight_decay=1e-3, preservation_cache=None, checkpoint_selection='best',
           all_training=False):
     if all_training and checkpoint_selection != 'last':
         raise ValueError('All-training mode requires last-epoch checkpoint selection')
@@ -122,11 +209,17 @@ def train(backend, cache, output, epochs=250, patience=20, batch_size=64, seed=0
     human = [e for e in examples if (all_training or e["window"]["split"] == "train") and e["normalized"]["accepted"]]
     if not human:
         raise ValueError("No accepted human training examples")
-    if Dataset(meta["manifest"]["dataset"]).identity() != meta["manifest"]["dataset_identity"]:
-        raise ValueError("Dataset changed since inversion")
+    if not all_training:
+        train_eps = {e['window']['episode'] for e in examples if e['window']['split'] == 'train'}
+        val_eps = {e['window']['episode'] for e in examples if e['window']['split'] == 'validation'}
+        test_eps = {e['window']['episode'] for e in examples if e['window']['split'] == 'test'}
+        if train_eps & val_eps or train_eps & test_eps or val_eps & test_eps:
+            raise ValueError("Episode split leakage")
+    verify_cache_datasets(meta)
     actor = SteeringActor(human[0]["patches"].shape[-1]).to(backend.device)
     optimizer = torch.optim.AdamW(actor.parameters(), lr=learning_rate, weight_decay=weight_decay)
     auto = []
+    trace_validation = []
     preservation_meta, preservation_validation = None, []
     excluded = []
     if autonomous and preservation_cache:
@@ -142,7 +235,19 @@ def train(backend, cache, output, epochs=250, patience=20, batch_size=64, seed=0
             raise ValueError("Human exclusions removed all accepted training examples")
     if autonomous:
         from .traces import preservation_examples
-        auto = preservation_examples(autonomous, meta["identity"], meta["manifest"]["splits"]["train"])
+        if autonomous == 'merged':
+            if not meta.get('autonomous_roots'):
+                raise ValueError('Aggregate has no trace sources')
+            for sid,root in meta['autonomous_roots'].items():
+                splits = meta['sources'][sid]['manifest']['splits']
+                auto.extend(preservation_examples(root, meta['identity'], splits['train'], allow_empty=True))
+                trace_validation.extend(preservation_examples(root, meta['identity'], splits['validation'], allow_empty=True, records=True))
+            if not auto:
+                raise ValueError('No eligible autonomous anchors in aggregate')
+        else:
+            auto = preservation_examples(autonomous, meta["identity"], meta["manifest"]["splits"]["train"])
+            trace_validation = preservation_examples(autonomous, meta['identity'],
+                meta['manifest']['splits']['validation'], allow_empty=True, records=True)
     if epochs < 1 or epochs > 250 or patience < 1 or batch_size < 1:
         raise ValueError("Use 1..250 epochs and positive patience/batch size")
     if auto and (batch_size < 2 or batch_size % 2):
@@ -165,15 +270,30 @@ def train(backend, cache, output, epochs=250, patience=20, batch_size=64, seed=0
     best, stale, history = float("inf"), 0, []
     for epoch in range(epochs):
         actor.train()
-        loss_sum, samples = 0., 0
-        for batch in DataLoader(human, batch_size=human_batch_size, shuffle=True, collate_fn=lambda rows: rows):
+        loss_sum, samples, human_sum, auto_sum = 0., 0, 0., 0.
+        # Each intervention segment receives equal total sampling probability.
+        from collections import Counter
+        from torch.utils.data import WeightedRandomSampler
+        segments = [(e['window']['episode'], e['window'].get('segment', 0)) for e in human]
+        counts = Counter(segments)
+        episode_segments = Counter(s[0] for s in counts)
+        sampler = WeightedRandomSampler([1/(counts[s]*episode_segments[s[0]]) for s in segments], len(human), replacement=True)
+        auto_episodes = [e.get('episode',e.get('window',{}).get('episode',0)) for e in auto]
+        auto_counts = Counter(auto_episodes)
+        auto_weights = torch.tensor([1/auto_counts[ep] for ep in auto_episodes])
+        for batch in DataLoader(human, batch_size=human_batch_size, sampler=sampler, collate_fn=lambda rows: rows):
             def loss(rows):
                 patches, state, noise = [torch.stack([r[k] for r in rows]).to(backend.device) for k in ("patches", "state", "noise")]
                 return (actor(patches, state) - noise).square().mean()
             value = loss(batch)
+            human_sum += value.detach().item()*len(batch)
             if auto:
-                indices = torch.randint(len(auto), (len(batch),)).tolist()
-                value = .5 * value + .5 * loss([auto[i] for i in indices])
+                indices = torch.multinomial(auto_weights, len(batch), replacement=True).tolist()
+                auto_loss = loss([auto[i] for i in indices])
+                auto_sum += auto_loss.detach().item()*len(batch)
+                value = .5 * value + .5 * auto_loss
+            if not torch.isfinite(value):
+                raise RuntimeError("Nonfinite training loss")
             optimizer.zero_grad()
             value.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.)
@@ -199,7 +319,12 @@ def train(backend, cache, output, epochs=250, patience=20, batch_size=64, seed=0
             auto_report = evaluate(backend, actor, preservation_meta, preservation_validation, "validation", baselines=False)
             preservation_score = auto_report["mean_normalized_rmse"]["steered"]
             score = .5 * (human_score + preservation_score)
-        history.append(dict(epoch=epoch, validation_decoded_rmse=human_score,
+        elif trace_validation:
+            preservation_score = evaluate_traces(backend, actor, trace_validation)
+            score = .5 * (human_score + preservation_score)
+        history.append(dict(epoch=epoch, human_noise_mse=human_sum/samples,
+                            autonomous_noise_mse=auto_sum/samples if auto else None,
+                            validation_decoded_rmse=human_score,
                             preservation_validation_decoded_rmse=preservation_score, selection_score=score))
         write_json(Path(output).with_suffix(".history.json"), history)
         print(history[-1], flush=True)

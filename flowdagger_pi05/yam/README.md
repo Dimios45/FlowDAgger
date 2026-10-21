@@ -1,5 +1,10 @@
 # FlowDAgger for bimanual YAM cloth folding
 
+For the new **JAX / 60-second / identity-gripper** collection and validation
+workflow, use [the JAX runbook](../yam_jax/README.md). The experiment described
+below is historical; its old convention manifests and all-training checkpoints
+are not defaults for the new collection path.
+
 Native PyTorch/LeRobot adaptation of a frozen pi0.5 policy. A small steering
 network predicts the initial sampling noise; the base model generates absolute
 joint/gripper action targets. The JAX/openpi MetaWorld reference remains separate.

@@ -1,0 +1,8 @@
+{
+  "mapping": "identity",
+  "verified": true,
+  "dataset_open": 1,
+  "model_open": 1,
+  "wire_open": 1,
+  "evidence": "User-confirmed 2026-10-18: LeRobot v3 state/action and model wire share one gripper convention; Quest input conversion is upstream. No import or serving flip."
+}

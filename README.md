@@ -69,6 +69,12 @@ MIT. See [LICENSE](LICENSE).
 
 ## YAM / native PyTorch pi0.5
 
+For the new JAX checkpoint, identity-gripper recording/import, three-camera
+steering and staged 60-second HITL rounds, see the
+[JAX YAM runbook](flowdagger_pi05/yam_jax/README.md) and the
+[Karma collection patch](integrations/karma/README.md). The PyTorch experiment
+below remains available as historical reference.
+
 The separate [YAM backend](flowdagger_pi05/yam/README.md) provides prepare, invert,
 train, evaluate, verify, and Karma HTTP serving commands for a frozen LeRobot
 checkpoint. Preparation requires a verified gripper-convention manifest.

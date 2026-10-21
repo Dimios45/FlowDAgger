@@ -37,6 +37,12 @@ def checkpoint_identity(root):
 
 
 def verify_conventions(c):
+    if c.get("mapping") == "identity":
+        if c.get("verified") is not True or not c.get("evidence"):
+            raise ValueError("Identity mapping requires explicit confirmation/evidence")
+        if len({c.get(k) for k in ("dataset_open", "model_open", "wire_open")}) != 1 or c.get("model_open") not in (0, 1):
+            raise ValueError("Identity mapping requires identical conventions")
+        return c
     for key in ("dataset_open", "model_open", "wire_open"):
         if c.get(key) not in (0, 1) or isinstance(c.get(key), bool):
             raise ValueError(f"Explicit {key}=0 or 1 is required")
@@ -79,7 +85,7 @@ def invert(velocity, target):
 
 
 def errors(prediction, target):
-    e = (prediction[..., :14].float() - target[..., :14].float()).cpu()
+    e = (prediction[..., :14].float() - target[..., :14].to(prediction.device).float()).cpu()
     if not torch.isfinite(e).all():
         return {"finite": False, "accepted": False}
     channel = e.square().reshape(-1, 14).mean(0).sqrt()
